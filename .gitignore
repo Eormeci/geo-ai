@@ -2,3 +2,8 @@
 !.gitignore
 !*.ipynb
 !*/
+xView2-segmentation/
+xView2-deploy/
+pytorch-change-models/
+notebooks/venv/
+xview2_1st_weights.zip
