@@ -166,40 +166,35 @@ with st.sidebar:
 
         st.markdown("**Haritaya tıklayarak konum seçin**")
 
-        m = folium.Map(location=[40.7593, 29.8239], zoom_start=13)
+        sel_lat = st.session_state.get("click_lat", None)
+        sel_lon = st.session_state.get("click_lon", None)
 
-        sel_lat = st.session_state.get("click_lat", 40.7593)
-        sel_lon = st.session_state.get("click_lon", 29.8239)
+        map_center = [sel_lat, sel_lon] if sel_lat else [40.7593, 29.8239]
+        m = folium.Map(location=map_center, zoom_start=5 if sel_lat is None else 13)
 
-        fg = folium.FeatureGroup()
-        folium.Marker(
-            [sel_lat, sel_lon],
-            popup=f"{sel_lat:.4f}°N, {sel_lon:.4f}°E",
-            icon=folium.Icon(color="red", icon="crosshairs", prefix="fa"),
-        ).add_to(fg)
+        if sel_lat is not None and sel_lon is not None:
+            folium.Marker(
+                [sel_lat, sel_lon],
+                popup=f"{sel_lat:.4f}°N, {sel_lon:.4f}°E",
+                icon=folium.Icon(color="red", icon="crosshairs", prefix="fa"),
+            ).add_to(m)
 
-        map_result = st_folium(
-            m,
-            height=400,
-            use_container_width=True,
-            key="map_click_selector",
-            returned_objects=["last_clicked"],
-            feature_group_to_add=fg,
-        )
+        map_data = st_folium(m, height=400, use_container_width=True)
 
-        if map_result and map_result.get("last_clicked"):
-            clicked = map_result["last_clicked"]
-            st.session_state["click_lat"] = clicked["lat"]
-            st.session_state["click_lon"] = clicked["lng"]
+        if map_data and map_data.get("last_clicked"):
+            st.session_state["click_lat"] = map_data["last_clicked"]["lat"]
+            st.session_state["click_lon"] = map_data["last_clicked"]["lng"]
+            st.rerun()
 
-        sel_lat = st.session_state.get("click_lat", sel_lat)
-        sel_lon = st.session_state.get("click_lon", sel_lon)
+        sel_lat = st.session_state.get("click_lat", None)
+        sel_lon = st.session_state.get("click_lon", None)
 
-        st.markdown(
-            f"**Seçilen Konum:** `{sel_lat:.4f}°N, {sel_lon:.4f}°E`"
-        )
+        if sel_lat is not None and sel_lon is not None:
+            st.markdown(f"**Seçilen Konum:** `{sel_lat:.4f}°N, {sel_lon:.4f}°E`")
+        else:
+            st.info("Haritaya tıklayarak bir konum seçin")
 
-        if st.button("Bu konumu kullan", key="use_map"):
+        if st.button("Bu konumu kullan", key="use_map", disabled=(sel_lat is None)):
             loc_data = {
                 "center": [sel_lon, sel_lat],
                 "bbox": [
