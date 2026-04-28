@@ -14,7 +14,13 @@ import os
 import time
 import tempfile
 import shutil
+import json
+import re
 from pathlib import Path
+from collections import Counter
+from html import escape
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import streamlit as st
 import numpy as np
@@ -51,13 +57,576 @@ def _norm_rgb(arr):
     return arr.astype(np.uint8)
 
 
+def _arcgis_get_json(url: str, params: dict[str, object]) -> dict:
+    query_string = urlencode(params)
+    with urlopen(f"{url}?{query_string}") as response:
+        return json.load(response)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _find_public_feature_service(search_query: str) -> dict:
+    payload = _arcgis_get_json(
+        "https://www.arcgis.com/sharing/rest/search",
+        {
+            "q": search_query,
+            "sortField": "numviews",
+            "sortOrder": "desc",
+            "num": 10,
+            "f": "json",
+        },
+    )
+    for result in payload.get("results", []):
+        if result.get("type") == "Feature Service" and result.get("url"):
+            return result
+    raise RuntimeError(f"Public feature service bulunamadı: {search_query}")
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _find_point_layer_url(service_url: str) -> tuple[str, str]:
+    payload = _arcgis_get_json(service_url, {"f": "json"})
+    for layer in payload.get("layers", []):
+        layer_id = layer.get("id")
+        if layer_id is None:
+            continue
+        layer_url = f"{service_url}/{layer_id}"
+        layer_meta = _arcgis_get_json(layer_url, {"f": "json"})
+        if layer_meta.get("geometryType") == "esriGeometryPoint":
+            return layer_url, layer_meta.get("name", f"Layer {layer_id}")
+    raise RuntimeError("Servis içinde point geometry layer bulunamadı.")
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _query_point_features(layer_url: str, max_records: int) -> list[tuple[float, float, dict]]:
+    payload = _arcgis_get_json(
+        f"{layer_url}/query",
+        {
+            "where": "1=1",
+            "outFields": "*",
+            "returnGeometry": "true",
+            "f": "json",
+            "resultRecordCount": max_records,
+            "outSR": 4326,
+        },
+    )
+    points = []
+    for feature in payload.get("features", []):
+        geometry = feature.get("geometry") or {}
+        x = geometry.get("x")
+        y = geometry.get("y")
+        if x is None or y is None:
+            continue
+        points.append((y, x, feature.get("attributes") or {}))
+    if not points:
+        raise RuntimeError("Sorgudan nokta geometri dönmedi.")
+    return points
+
+
+# LLM_API_URL = "http://192.168.1.200:8001/v1/chat/completions"
+# LLM_MODEL = "moonshotai/Kimi-K2.6"
+LLM_API_URL = "http://192.168.1.200:8000/v1/chat/completions"
+LLM_MODEL = "GLM-5.1-FP8"
+
+FIELD_HINTS = {
+    "crime_type": [
+        "primary_type", "crime_type", "offense", "offense_type", "category",
+        "incident_type", "ucr_desc", "violation", "type",
+    ],
+    "description": [
+        "description", "desc", "details", "summary", "subtype",
+        "secondary", "location_description", "crime_desc",
+    ],
+    "city": ["city", "municipality", "town", "village"],
+    "district": [
+        "district", "beat", "ward", "community_area", "community",
+        "neighborhood", "region", "county", "state",
+    ],
+    "date": ["date", "incident_date", "reported_date", "report_date", "datetime", "timestamp"],
+}
+
+VEHICLE_THEFT_TERMS = [
+    "vehicle theft", "motor vehicle theft", "stolen vehicle", "stolen auto",
+    "auto theft", "car theft", "araba hirsizligi", "arac hirsizligi",
+    "otomobil hirsizligi", "vehicle", "auto", "car",
+]
+
+
+def _normalize_text(value) -> str:
+    text = "" if value is None else str(value)
+    text = text.strip().lower()
+    text = text.replace("ı", "i").replace("İ", "i").replace("ş", "s").replace("ğ", "g")
+    text = text.replace("ü", "u").replace("ö", "o").replace("ç", "c")
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _safe_label(value) -> str:
+    if value is None:
+        return "Bilinmiyor"
+    text = str(value).strip()
+    return text if text else "Bilinmiyor"
+
+
+def _find_best_field(field_names: list[str], hint_keys: list[str]) -> str | None:
+    scored = []
+    for field in field_names:
+        norm = _normalize_text(field)
+        score = 0
+        for idx, hint in enumerate(hint_keys):
+            if norm == hint:
+                score += 100 - idx
+            elif hint in norm:
+                score += 50 - idx
+        if score > 0:
+            scored.append((score, field))
+    return max(scored)[1] if scored else None
+
+
+def _infer_category_field(points: list[tuple[float, float, dict]]) -> str | None:
+    _, _, sample = points[0]
+    skip = {"objectid", "fid", "oid", "id", "globalid", "shape", "geometry",
+            "xcoord", "ycoord", "latitude", "longitude", "the_geom"}
+    candidates = []
+    for field in sorted(sample.keys()):
+        norm = _normalize_text(field)
+        if any(s in norm for s in skip):
+            continue
+        values = [attrs.get(field) for _, _, attrs in points]
+        non_null = [v for v in values if v is not None and str(v).strip()]
+        if len(non_null) < max(3, len(points) * 0.3):
+            continue
+        str_values = [str(v).strip() for v in non_null]
+        unique = len(set(str_values))
+        ratio = unique / len(str_values) if str_values else 0
+        if all(_is_number(v) for v in str_values[:30]):
+            continue
+        if ratio < 0.01 or ratio > 0.95:
+            continue
+        avg_len = sum(len(v) for v in str_values) / len(str_values)
+        if avg_len > 80:
+            continue
+        candidates.append((field, ratio, unique, avg_len))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (-c[2] if c[2] < 30 else 30, c[3]))
+    return candidates[0][0]
+
+
+def _infer_location_field(points: list[tuple[float, float, dict]], hint_keys: list[str]) -> str | None:
+    name_match = _find_best_field(
+        sorted({k for _, _, a in points for k in a.keys()}), hint_keys
+    )
+    if name_match:
+        values = [str(attrs.get(name_match, "")).strip() for _, _, attrs in points]
+        non_null = [v for v in values if v and v != "None"]
+        unique = len(set(non_null))
+        ratio = unique / len(non_null) if non_null else 0
+        if 0.01 < ratio < 0.95 and unique < len(points) * 0.8:
+            return name_match
+    for field in sorted({k for _, _, a in points for k in a.keys()}):
+        if _find_best_field([field], hint_keys):
+            continue
+        values = [str(attrs.get(field, "")).strip() for _, _, attrs in points]
+        non_null = [v for v in values if v and v != "None"]
+        if len(non_null) < max(3, len(points) * 0.3):
+            continue
+        unique = len(set(non_null))
+        ratio = unique / len(non_null) if non_null else 0
+        if all(_is_number(v) for v in non_null[:30]):
+            continue
+        if 0.01 < ratio < 0.3 and unique < len(points) * 0.5:
+            return field
+    return None
+
+
+def _infer_date_field(points: list[tuple[float, float, dict]]) -> str | None:
+    date_patterns = [
+        re.compile(r"\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}"),
+        re.compile(r"\d{4}[/.-]\d{1,2}[/.-]\d{1,2}"),
+    ]
+    for field in sorted({k for _, _, a in points for k in a.keys()}):
+        norm = _normalize_text(field)
+        if any(t in norm for t in ["objectid", "id", "globalid", "shape"]):
+            continue
+        values = [attrs.get(field) for _, _, attrs in points]
+        non_null = [v for v in values if v is not None and str(v).strip()]
+        if len(non_null) < max(3, len(points) * 0.3):
+            continue
+        str_values = [str(v).strip() for v in non_null[:20]]
+        date_count = sum(1 for v in str_values if any(p.search(v) for p in date_patterns))
+        if date_count > len(str_values) * 0.5:
+            return field
+        if isinstance(non_null[0], (int, float)) and non_null[0] > 1e12:
+            return field
+    return _find_best_field(
+        sorted({k for _, _, a in points for k in a.keys()}), FIELD_HINTS["date"]
+    )
+
+
+def _is_number(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _top_field_values(points: list[tuple[float, float, dict]], field_name: str | None, limit: int = 12) -> list[str]:
+    if not field_name:
+        return []
+    counter = Counter()
+    for _, _, attrs in points:
+        value = attrs.get(field_name)
+        if value not in (None, ""):
+            counter[_safe_label(value)] += 1
+    return [value for value, _ in counter.most_common(limit)]
+
+
+def _build_dataset_profile(points: list[tuple[float, float, dict]]) -> dict:
+    field_names = sorted({key for _, _, attrs in points for key in attrs.keys()})
+    category_field = _infer_category_field(points)
+    if category_field:
+        hints_match = _find_best_field(field_names, FIELD_HINTS["crime_type"])
+        crime_type = hints_match if hints_match else category_field
+    else:
+        crime_type = _find_best_field(field_names, FIELD_HINTS["crime_type"])
+    inferred = {
+        "crime_type": crime_type,
+        "description": _find_best_field(field_names, FIELD_HINTS["description"]),
+        "city": _infer_location_field(points, FIELD_HINTS["city"]),
+        "district": _infer_location_field(points, FIELD_HINTS["district"]),
+        "date": _infer_date_field(points),
+    }
+    if inferred["city"] == inferred["district"]:
+        inferred["district"] = None
+    profile = {
+        "field_names": field_names,
+        "inferred": inferred,
+        "top_crime_values": _top_field_values(points, inferred["crime_type"]),
+        "top_city_values": _top_field_values(points, inferred["city"]),
+        "top_district_values": _top_field_values(points, inferred["district"]),
+        "record_count": len(points),
+        "sample_rows": [],
+    }
+    for _, _, attrs in points[:3]:
+        sample = {}
+        for key in field_names[:8]:
+            if key in attrs:
+                sample[key] = attrs[key]
+        profile["sample_rows"].append(sample)
+    return profile
+
+
+def _build_field_overview(points: list[tuple[float, float, dict]]) -> list[dict]:
+    if not points:
+        return []
+    skip_norms = {
+        "objectid", "shape", "geometry", "fid", "oid",
+        "x_coordinate", "y_coordinate", "latitude", "longitude",
+        "xcoord", "ycoord", "gdb_geomattr_data", "globalid",
+        "creationdate", "creator", "editdate", "editor",
+    }
+    all_fields = sorted({key for _, _, attrs in points for key in attrs.keys()})
+    overview = []
+    for field in all_fields:
+        norm = _normalize_text(field)
+        if norm in skip_norms:
+            continue
+        values = []
+        for _, _, attrs in points:
+            v = attrs.get(field)
+            if v is not None and str(v).strip() and str(v).strip() != "None":
+                values.append(v)
+        if not values:
+            continue
+        counter = Counter(_safe_label(v) for v in values)
+        is_numeric = all(isinstance(v, (int, float)) for v in values[:30]) if values else False
+        overview.append({
+            "field": field,
+            "type": "sayi" if is_numeric else "metin",
+            "non_null": len(values),
+            "unique": len(counter),
+            "top_values": [v for v, _ in counter.most_common(5)],
+        })
+    return overview
+
+
+def _call_llm(messages: list[dict], temperature: float = 0.1, max_tokens: int = 2048) -> str:
+    import requests as req
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    response = req.post(LLM_API_URL, json=payload, timeout=120)
+    response.raise_for_status()
+    content = response.json()["choices"][0]["message"]["content"]
+    if content is None:
+        raise ValueError("LLM content None dondurdu")
+    return content
+
+
+def _extract_json_block(text: str) -> dict | None:
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def _fallback_question_plan(question: str, profile: dict) -> dict:
+    q = _normalize_text(question)
+    plan = {
+        "intent": "summary",
+        "crime_keywords": [],
+        "location_text": "",
+        "group_by": "crime_type",
+        "limit": 10,
+    }
+    if any(token in q for token in ["araba", "arac", "oto", "vehicle", "auto", "car"]):
+        plan["crime_keywords"] = VEHICLE_THEFT_TERMS
+        plan["intent"] = "top_locations"
+        plan["group_by"] = "city" if profile["inferred"].get("city") else "district"
+    if any(token in q for token in ["hangi suclar", "hangi suçlar", "what crimes", "ne sucu", "ne suç"]):
+        plan["intent"] = "top_crimes"
+        plan["group_by"] = "crime_type"
+    if any(token in q for token in ["hangi sehir", "hangi şehir", "where", "nerede", "hangi bolge", "hangi bölge"]):
+        plan["intent"] = "top_locations"
+        plan["group_by"] = "city" if profile["inferred"].get("city") else "district"
+    for value in profile.get("top_city_values", []) + profile.get("top_district_values", []):
+        if _normalize_text(value) and _normalize_text(value) in q:
+            plan["location_text"] = value
+            break
+    return plan
+
+
+def _plan_question(question: str, profile: dict) -> dict:
+    schema_payload = {
+        "inferred_fields": profile["inferred"],
+        "top_city_values": profile["top_city_values"][:10],
+        "top_district_values": profile["top_district_values"][:10],
+        "top_crime_values": profile["top_crime_values"][:10],
+    }
+    prompt = f"""
+You convert the user's question into a compact JSON query plan for a crime map dataset.
+Return only valid JSON.
+
+Allowed intent values: summary, top_crimes, top_locations, count
+Allowed group_by values: crime_type, city, district, none
+Rules:
+- If the user asks about vehicle or car theft, set crime_keywords to vehicle theft synonyms.
+- If a location is mentioned, copy it into location_text.
+- Prefer city, otherwise district.
+- Do not invent fields outside the schema.
+
+Schema:
+{json.dumps(schema_payload, ensure_ascii=False)}
+
+User question:
+{question}
+
+JSON shape:
+{{
+  "intent": "summary",
+  "crime_keywords": [],
+  "location_text": "",
+  "group_by": "crime_type",
+  "limit": 10
+}}
+""".strip()
+    try:
+        content = _call_llm(
+            [
+                {"role": "system", "content": "You are a strict JSON planner."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=1024,
+        )
+        plan = _extract_json_block(content)
+        if plan:
+            return {
+                "intent": plan.get("intent", "summary"),
+                "crime_keywords": plan.get("crime_keywords", []) or [],
+                "location_text": plan.get("location_text", "") or "",
+                "group_by": plan.get("group_by", "crime_type"),
+                "limit": int(plan.get("limit", 10) or 10),
+            }
+    except Exception:
+        pass
+    return _fallback_question_plan(question, profile)
+
+
+def _row_matches_text(attrs: dict, fields: list[str], terms: list[str]) -> bool:
+    if not terms:
+        return True
+    haystack = " ".join(_normalize_text(attrs.get(field, "")) for field in fields if field)
+    return any(_normalize_text(term) in haystack for term in terms if term)
+
+
+def _location_matches(attrs: dict, profile: dict, location_text: str) -> bool:
+    if not location_text:
+        return True
+    fields = [profile["inferred"].get("city"), profile["inferred"].get("district")]
+    haystack = " ".join(_normalize_text(attrs.get(field, "")) for field in fields if field)
+    return _normalize_text(location_text) in haystack
+
+
+def _execute_question_plan(points: list[tuple[float, float, dict]], profile: dict, plan: dict) -> dict:
+    crime_fields = [profile["inferred"].get("crime_type"), profile["inferred"].get("description")]
+    matched = []
+    for lat, lon, attrs in points:
+        if not _location_matches(attrs, profile, plan.get("location_text", "")):
+            continue
+        if not _row_matches_text(attrs, crime_fields, plan.get("crime_keywords", [])):
+            continue
+        matched.append((lat, lon, attrs))
+
+    group_key = plan.get("group_by", "crime_type")
+    resolved_group_field = None
+    if group_key == "crime_type":
+        resolved_group_field = profile["inferred"].get("crime_type")
+    elif group_key == "city":
+        resolved_group_field = profile["inferred"].get("city")
+    elif group_key == "district":
+        resolved_group_field = profile["inferred"].get("district")
+
+    grouped = []
+    if resolved_group_field:
+        counter = Counter()
+        for _, _, attrs in matched:
+            counter[_safe_label(attrs.get(resolved_group_field))] += 1
+        grouped = [{"name": name, "count": count} for name, count in counter.most_common(plan.get("limit", 10))]
+
+    top_crimes = []
+    crime_field = profile["inferred"].get("crime_type")
+    if crime_field:
+        crime_counter = Counter()
+        for _, _, attrs in matched:
+            crime_counter[_safe_label(attrs.get(crime_field))] += 1
+        top_crimes = [{"name": name, "count": count} for name, count in crime_counter.most_common(10)]
+
+    top_locations = []
+    loc_field = profile["inferred"].get("city") or profile["inferred"].get("district")
+    if loc_field:
+        loc_counter = Counter()
+        for _, _, attrs in matched:
+            loc_counter[_safe_label(attrs.get(loc_field))] += 1
+        top_locations = [{"name": name, "count": count} for name, count in loc_counter.most_common(10)]
+
+    sample_records = []
+    preview_fields = [
+        profile["inferred"].get("crime_type"),
+        profile["inferred"].get("description"),
+        profile["inferred"].get("city"),
+        profile["inferred"].get("district"),
+        profile["inferred"].get("date"),
+    ]
+    for _, _, attrs in matched[:5]:
+        row = {}
+        for field in preview_fields:
+            if field:
+                row[field] = attrs.get(field)
+        sample_records.append(row)
+
+    return {
+        "matched_count": len(matched),
+        "total_count": len(points),
+        "grouped": grouped,
+        "top_crimes": top_crimes,
+        "top_locations": top_locations,
+        "sample_records": sample_records,
+        "matched_points": matched[:200],
+    }
+
+
+def _fallback_answer(question: str, plan: dict, result: dict) -> str:
+    lines = [f"Toplam {result['matched_count']} kayıt eşleşti."]
+    if plan.get("location_text"):
+        lines.append(f"Konum filtresi: {plan['location_text']}.")
+    if plan.get("crime_keywords"):
+        lines.append("Suç filtresi uygulandı.")
+    if result["grouped"]:
+        top = ", ".join(f"{item['name']} ({item['count']})" for item in result["grouped"][:5])
+        lines.append(f"Öne çıkan dağılım: {top}.")
+    elif result["top_crimes"]:
+        top = ", ".join(f"{item['name']} ({item['count']})" for item in result["top_crimes"][:5])
+        lines.append(f"En sık suçlar: {top}.")
+    if result["matched_count"] == 0:
+        lines = ["Soruya uyan kayıt bulunamadı. Farklı bir şehir, bölge veya suç ifadesi deneyin."]
+    return "\n".join(lines)
+
+
+def _answer_question(question: str, profile: dict, plan: dict, result: dict) -> str:
+    summary_payload = {
+        "question": question,
+        "plan": plan,
+        "matched_count": result["matched_count"],
+        "total_count": result["total_count"],
+        "top_crimes": result["top_crimes"][:5],
+        "top_locations": result["top_locations"][:5],
+        "grouped": result["grouped"][:8],
+        "sample_records": result["sample_records"][:3],
+        "inferred_fields": profile["inferred"],
+    }
+    prompt = f"""
+Use only the supplied analysis result. Answer in Turkish.
+Be precise, short, and data-grounded. If the result is empty, say no matching records were found.
+Mention which location or crime filter was used when relevant.
+
+Analysis:
+{json.dumps(summary_payload, ensure_ascii=False)}
+""".strip()
+    try:
+        return _call_llm(
+            [
+                {"role": "system", "content": "You answer questions about map data using only supplied analysis."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=2048,
+        )
+    except Exception:
+        return _fallback_answer(question, plan, result)
+
+
+def _build_folium_map(points: list[tuple[float, float, dict]], title_fields: list[str] | None = None):
+    import folium
+    from folium.plugins import MarkerCluster
+
+    center_lat = sum(lat for lat, _, _ in points) / len(points)
+    center_lon = sum(lon for _, lon, _ in points) / len(points)
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles="CartoDB positron")
+    cluster = MarkerCluster().add_to(m)
+    for lat, lon, attrs in points:
+        popup_lines = []
+        fields = title_fields or list(attrs.keys())[:8]
+        for key in fields[:8]:
+            popup_lines.append(f"<b>{escape(str(key))}</b>: {escape(str(attrs.get(key)))}")
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=4,
+            color="#c2410c",
+            fill=True,
+            fill_color="#ea580c",
+            fill_opacity=0.7,
+            weight=1,
+            popup=folium.Popup("<br>".join(popup_lines), max_width=320),
+        ).add_to(cluster)
+    return m
+
+
 DEMOS = {
-    "01 — Metinle Segmentasyon": "CLIPSeg / GroundedSAM / SamGeo / xView2-Loc",
+    "01 — Metinle Segmentasyon": " ",
     "02 — Görüntü Analizi": "VLM ile Uydu Görüntüsü Analizi",
     "03 — Ajan Analizi": "AI Ajan ile Uçtan Uca Analiz",
-    "04 — Hasar Tespiti": "xView2 Bina Hasar Sınıflandırma",
+    "04 — Hasar Tespiti": "Bina Hasar Sınıflandırma",
     "05 — Süper Çözünürlük": "4x Uydu Görüntüsü Süper Çözünürlük",
-    "06 — Değişim Tespiti": "AnyChange ile Değişim Tespiti",
+    "06 — Değişim Tespiti": "Değişim Tespiti",
+    "07 — Folium Harita": "Suç haritasını interaktif haritada göster",
 }
 
 st.set_page_config(
@@ -96,7 +665,7 @@ with st.sidebar:
         from streamlit_folium import st_folium
 
         m = folium.Map(
-            location=[loc_data["center"][1], loc_data["center"][0]], zoom_start=12
+            location=[loc_data["center"][1], loc_data["center"][0]], zoom_start=10
         )
         folium.Marker(
             [loc_data["center"][1], loc_data["center"][0]],
@@ -131,7 +700,7 @@ with st.sidebar:
         import folium
         from streamlit_folium import st_folium
 
-        m = folium.Map(location=[lat, lon], zoom_start=12)
+        m = folium.Map(location=[lat, lon], zoom_start=10)
         folium.Marker(
             [lat, lon],
             popup=f"{lat:.4f}°N, {lon:.4f}°E",
@@ -170,7 +739,7 @@ with st.sidebar:
         sel_lon = st.session_state.get("click_lon", None)
 
         map_center = [sel_lat, sel_lon] if sel_lat else [40.7593, 29.8239]
-        m = folium.Map(location=map_center, zoom_start=5 if sel_lat is None else 13)
+        m = folium.Map(location=map_center, zoom_start=5 if sel_lat is None else 11)
 
         if sel_lat is not None and sel_lon is not None:
             folium.Marker(
@@ -248,7 +817,7 @@ if demo_choice.startswith("01"):
     prompt = st.text_input(
         "Ne arıyorsun?", value="road", placeholder="road, buildings, trees, water..."
     )
-    threshold = st.slider("GroundedSAM Eşiği", 0.05, 0.5, 0.2, 0.05)
+    
 
     if st.button("🚀 Çalıştır", type="primary"):
         if not input_path:
@@ -293,6 +862,20 @@ if demo_choice.startswith("01"):
                         segmenter_id="facebook/sam-vit-base",
                         threshold=threshold,
                     )
+
+                    _orig_gsam_detect = model._detect
+                    def _gsam_detect_filtered(image, labels, _orig=_orig_gsam_detect, _max_ratio=0.35):
+                        results = _orig(image, labels)
+                        if results:
+                            img_w, img_h = image.size
+                            img_area = img_w * img_h
+                            return [
+                                r for r in results
+                                if (r.box.xmax - r.box.xmin) * (r.box.ymax - r.box.ymin) / img_area <= _max_ratio
+                            ]
+                        return results
+                    model._detect = _gsam_detect_filtered
+
                     gsam_path = str(out / "grounded_sam.tif")
                     result = model.segment_image(
                         input_path=str(input_path),
@@ -453,7 +1036,7 @@ elif demo_choice.startswith("02"):
             for q in questions:
                 with st.spinner(f'Soruluyor: "{q[:50]}..."'):
                     payload = {
-                        "model": "GLM-5.1-FP8",
+                        "model": LLM_MODEL,
                         "messages": [
                             {
                                 "role": "user",
@@ -472,7 +1055,7 @@ elif demo_choice.startswith("02"):
                         "temperature": 0.3,
                     }
                     resp = req.post(
-                        "http://192.168.1.200:8000/v1/chat/completions",
+                        LLM_API_URL,
                         json=payload,
                         timeout=120,
                     )
@@ -497,8 +1080,8 @@ elif demo_choice.startswith("03"):
         import gc, torch, json
         import requests as req
 
-        API_URL = "http://192.168.1.200:8000/v1/chat/completions"
-        MODEL = "GLM-5.1-FP8"
+        API_URL = LLM_API_URL
+        MODEL = LLM_MODEL
         out = Path(st.session_state["out_dir"])
 
         TOOLS = [
@@ -963,12 +1546,12 @@ elif demo_choice.startswith("04"):
     TEST_POST = XVIEW2_DIR / "tests" / "data" / "input" / "post"
 
     st.markdown("""
-    **xView2 Bina Hasar Tespiti** — Afet sonrası uydu görüntülerinden bina hasarını sınıflandırır.
+    **Bina Hasar Tespiti** — Afet sonrası uydu görüntülerinden bina hasarını sınıflandırır.
     
     Hasar sınıfları: 🟢 Hasarsız · 🟡 Hafif Hasar · 🟠 Ağır Hasar · 🔴 Yıkılmış
     """)
 
-    use_test_data = st.checkbox("Örnek veriyi kullan (xView2 test verisi)", value=True)
+    use_test_data = st.checkbox("Örnek veriyi kullan", value=True)
 
     pre_path = None
     post_path = None
@@ -1208,41 +1791,22 @@ elif demo_choice.startswith("04"):
 # ── DEMO 06: Değişim Tespiti (AnyChange) ──────────────────────────
 elif demo_choice.startswith("06"):
     CHANGE_DIR = Path("/home/openzeka/Desktop/mekansal-veri/pytorch-change-models")
-    XVIEW2_DIR = Path("/home/openzeka/Desktop/mekansal-veri/xView2-deploy")
     DEMO_IMG_PRE = CHANGE_DIR / "demo_images" / "t1_img.png"
     DEMO_IMG_POST = CHANGE_DIR / "demo_images" / "t2_img.png"
-    XVIEW2_PRE = XVIEW2_DIR / "tests" / "data" / "input" / "pre"
-    XVIEW2_POST = XVIEW2_DIR / "tests" / "data" / "input" / "post"
 
     st.markdown("""
     **AnyChange ile Değişim Tespiti** — İki uydu görüntüsü arasındaki değişimleri SAM tabanlı AnyChange modeli ile tespit eder.
-    
-    Veri kaynağı olarak pytorch-change-models repo demosu veya xView2-deploy test verisi kullanılabilir.
     """)
-
-    data_src = st.radio("Veri Kaynağı", ["pytorch-change-models demo görüntüleri", "xView2-deploy test verisi"], horizontal=True)
 
     pre_path = None
     post_path = None
 
-    if data_src.startswith("pytorch"):
-        if DEMO_IMG_PRE.exists() and DEMO_IMG_POST.exists():
-            pre_path = str(DEMO_IMG_PRE)
-            post_path = str(DEMO_IMG_POST)
-            st.info(f"Pre: `{DEMO_IMG_PRE.name}` | Post: `{DEMO_IMG_POST.name}`")
-        else:
-            st.warning("Demo görüntüleri bulunamadı. Lütfen manuel olarak yükleyin.")
+    if DEMO_IMG_PRE.exists() and DEMO_IMG_POST.exists():
+        pre_path = str(DEMO_IMG_PRE)
+        post_path = str(DEMO_IMG_POST)
+        st.info(f"Pre: `{DEMO_IMG_PRE.name}` | Post: `{DEMO_IMG_POST.name}`")
     else:
-        pre_files = sorted(XVIEW2_PRE.glob("*.tif")) if XVIEW2_PRE.exists() else []
-        post_files = sorted(XVIEW2_POST.glob("*.tif")) if XVIEW2_POST.exists() else []
-        if pre_files and post_files:
-            sel = st.selectbox("Pre görüntü seç", range(len(pre_files)), format_func=lambda i: pre_files[i].name)
-            pre_path = str(pre_files[sel])
-            sel2 = st.selectbox("Post görüntü seç", range(len(post_files)), format_func=lambda i: post_files[i].name)
-            post_path = str(post_files[sel2])
-            st.info(f"Pre: `{Path(pre_path).name}` | Post: `{Path(post_path).name}`")
-        else:
-            st.warning("xView2 test verisi bulunamadı. Lütfen manuel olarak yükleyin.")
+        st.warning("Demo görüntüleri bulunamadı. Lütfen manuel olarak yükleyin.")
 
     upload_override = st.checkbox("Kendi görüntülerinizi yükleyin")
     if upload_override:
@@ -1371,7 +1935,7 @@ elif demo_choice.startswith("06"):
                     gc.collect()
 
 
-# ── DEMO 07: Görünmeyeni Gör ────────────────────────────────────────
+# ── DEMO 05: Görünmeyeni Gör ────────────────────────────────────────
 elif demo_choice.startswith("05"):
     steps = st.slider("Diffusion Adımları", 10, 200, 100, 10)
     patch_size = st.selectbox("Patch Boyutu", [64, 128, 256], index=1)
@@ -1456,6 +2020,554 @@ elif demo_choice.startswith("05"):
 
                 torch.cuda.empty_cache()
                 gc.collect()
+
+
+# ── DEMO 07: Folium Harita ──────────────────────────────────────────
+elif demo_choice.startswith("07"):
+    from streamlit_folium import st_folium
+
+    st.markdown("""
+    **ArcGIS Public Feature Service + Folium** — Public ArcGIS servislerinde arama yapar, nokta katmanını bulur ve sonucu interaktif haritada gösterir.
+    """)
+
+    search_query = st.text_input("Arama sorgusu", value="Chicago crime")
+    max_records = st.slider("Maksimum kayıt", 50, 1000, 300, 50)
+
+    @st.cache_data(show_spinner=False, ttl=1800)
+    def _search_services(query: str) -> list[dict]:
+        payload = _arcgis_get_json(
+            "https://www.arcgis.com/sharing/rest/search",
+            {
+                "q": query,
+                "sortField": "numviews",
+                "sortOrder": "desc",
+                "num": 10,
+                "f": "json",
+            },
+        )
+        results = []
+        for r in payload.get("results", []):
+            if r.get("type") == "Feature Service" and r.get("url"):
+                results.append({"title": r.get("title", "?"), "url": r["url"]})
+        return results
+
+    if st.button("🔍 Servisleri Ara", key="demo7_search"):
+        with st.spinner("ArcGIS'te aranıyor..."):
+            try:
+                services = _search_services(search_query)
+                st.session_state["demo7_services"] = services
+                if not services:
+                    st.warning("Sonuç bulunamadı")
+            except Exception as e:
+                st.error(f"Arama hatası: {e}")
+
+    services = st.session_state.get("demo7_services", [])
+    if services:
+        service_labels = [f"{s['title']}" for s in services]
+        selected_idx = st.selectbox(
+            "Servis seç",
+            range(len(services)),
+            format_func=lambda i: service_labels[i],
+            key="demo7_service_select",
+        )
+        selected_service = services[selected_idx]
+        st.caption(f"URL: `{selected_service['url']}`")
+
+        if st.button("🚀 Haritayı Oluştur", type="primary", key="demo7_build"):
+            with st.spinner("Katman sorgulanıyor..."):
+                try:
+                    layer_url, layer_name = _find_point_layer_url(selected_service["url"])
+                    points = _query_point_features(layer_url, max_records)
+                    profile = _build_dataset_profile(points)
+
+                    st.session_state["demo7_points"] = points
+                    st.session_state["demo7_profile"] = profile
+                    st.session_state["demo7_service_title"] = selected_service["title"]
+                    st.session_state["demo7_layer_name"] = layer_name
+                    st.session_state["demo7_query"] = search_query
+
+                    st.success(
+                        f"Servis: {selected_service['title']} | Katman: {layer_name} | Nokta: {len(points)}"
+                    )
+                except Exception as e:
+                    st.error(f"Hata: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+    points = st.session_state.get("demo7_points")
+    profile = st.session_state.get("demo7_profile")
+    service_title = st.session_state.get("demo7_service_title")
+    layer_name = st.session_state.get("demo7_layer_name")
+
+    if points and profile:
+        field_overview = _build_field_overview(points)
+
+        if field_overview:
+            with st.expander("Tüm Alanlar ve Örnek Değerler"):
+                overview_rows = []
+                for f in field_overview:
+                    overview_rows.append({
+                        "Alan": f["field"],
+                        "Tür": f["type"],
+                        "Dolu": f["non_null"],
+                        "Eşsiz": f["unique"],
+                        "Örnek Değerler": " | ".join(str(v)[:40] for v in f["top_values"][:5]),
+                    })
+                st.dataframe(overview_rows, use_container_width=True, hide_index=True)
+
+        st.subheader("Alan Eşleştirme")
+        st.caption("Otomatik algılanan alanları doğruysa onaylayın, yanlışsa düzeltin. Yanlış alan seçimi yanlış sonuç üretir.")
+        _all_field_names = sorted({key for _, _, attrs in points for key in attrs.keys()})
+        _field_options = ["(yok)"] + _all_field_names
+        _inferred = profile["inferred"]
+
+        _col_f1, _col_f2 = st.columns(2)
+        with _col_f1:
+            _ct_def = _inferred.get("crime_type") or "(yok)"
+            _ct_idx = _field_options.index(_ct_def) if _ct_def in _field_options else 0
+            _crime_type_sel = st.selectbox("Suç Türü alanı", _field_options, index=_ct_idx, key="demo7_field_crime")
+
+            _desc_def = _inferred.get("description") or "(yok)"
+            _desc_idx = _field_options.index(_desc_def) if _desc_def in _field_options else 0
+            _desc_sel = st.selectbox("Açıklama alanı", _field_options, index=_desc_idx, key="demo7_field_desc")
+
+            _date_def = _inferred.get("date") or "(yok)"
+            _date_idx = _field_options.index(_date_def) if _date_def in _field_options else 0
+            _date_sel = st.selectbox("Tarih alanı", _field_options, index=_date_idx, key="demo7_field_date")
+
+        with _col_f2:
+            _city_def = _inferred.get("city") or "(yok)"
+            _city_idx = _field_options.index(_city_def) if _city_def in _field_options else 0
+            _city_sel = st.selectbox("Şehir alanı", _field_options, index=_city_idx, key="demo7_field_city")
+
+            _dist_def = _inferred.get("district") or "(yok)"
+            _dist_idx = _field_options.index(_dist_def) if _dist_def in _field_options else 0
+            _district_sel = st.selectbox("Bölge/İlçe alanı", _field_options, index=_dist_idx, key="demo7_field_district")
+
+        profile["inferred"]["crime_type"] = _crime_type_sel if _crime_type_sel != "(yok)" else None
+        profile["inferred"]["description"] = _desc_sel if _desc_sel != "(yok)" else None
+        profile["inferred"]["date"] = _date_sel if _date_sel != "(yok)" else None
+        profile["inferred"]["city"] = _city_sel if _city_sel != "(yok)" else None
+        profile["inferred"]["district"] = _district_sel if _district_sel != "(yok)" else None
+        profile["top_crime_values"] = _top_field_values(points, profile["inferred"]["crime_type"])
+        profile["top_city_values"] = _top_field_values(points, profile["inferred"]["city"])
+        profile["top_district_values"] = _top_field_values(points, profile["inferred"]["district"])
+        st.session_state["demo7_profile"] = profile
+
+        st.subheader("Veri Şeması")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Kayıt", f"{profile['record_count']}")
+        c2.metric("Servis", service_title or "-")
+        c3.metric("Katman", layer_name or "-")
+
+        if profile["top_crime_values"]:
+            _crime_counter = Counter()
+            _crime_f = profile["inferred"]["crime_type"]
+            for _, _, attrs in points:
+                v = attrs.get(_crime_f)
+                if v is not None and str(v).strip():
+                    _crime_counter[_safe_label(v)] += 1
+            _top_str = ", ".join(
+                f"{v} ({_crime_counter.get(_safe_label(v), 0)})"
+                for v in profile["top_crime_values"][:6]
+            )
+            st.caption(f"En sık suç türleri: {_top_str}")
+
+        current_map_fields = [
+            profile["inferred"].get("crime_type"),
+            profile["inferred"].get("description"),
+            profile["inferred"].get("city"),
+            profile["inferred"].get("district"),
+            profile["inferred"].get("date"),
+        ]
+        current_map = _build_folium_map(points, [field for field in current_map_fields if field])
+        st_folium(
+            current_map,
+            height=520,
+            use_container_width=True,
+            returned_objects=[],
+            key="demo7_current_map",
+        )
+
+        st.subheader("Harita Agent")
+        st.caption("Agent, veri setini doğrudan sorgulamak için araçları kullanır. Harita görselini okumak yerine alttaki veriyi analiz eder.")
+        question = st.text_area(
+            "Harita hakkında soru sor",
+            value="Bu veri setinde en sık görülen suç türleri neler? Hangi bölgelerde yoğunlaşıyor?",
+            height=100,
+            key="demo7_question",
+        )
+        show_filtered_map = st.checkbox("Filtrelenmiş sonucu haritada göster", value=True)
+
+        if st.button("💬 Soruyu Cevapla", key="demo7_ask", type="primary"):
+            with st.spinner("Agent veriyi sorguluyor..."):
+                try:
+                    import requests as _req7
+
+                    _pts7 = points
+                    _prof7 = profile
+
+                    TOOLS_7 = [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_field_overview",
+                                "description": "Veri setindeki tüm alanları, türlerini ve en sık değerleri döner. Önce bunu çağırarak veriyi tanı.",
+                                "parameters": {"type": "object", "properties": {}, "required": []},
+                            },
+                        },
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_crime_distribution",
+                                "description": "Suç türlerinin dağılımını (sayı ve yüzde) döner.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "limit": {
+                                            "type": "integer",
+                                            "description": "Kaç kategori (varsayılan: 10)",
+                                        },
+                                    },
+                                    "required": [],
+                                },
+                            },
+                        },
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_location_distribution",
+                                "description": "Şehir veya bölge bazında dağılımı döner.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "group_by": {
+                                            "type": "string",
+                                            "enum": ["city", "district"],
+                                            "description": "Gruplama türü",
+                                        },
+                                        "limit": {
+                                            "type": "integer",
+                                            "description": "Kaç konum (varsayılan: 10)",
+                                        },
+                                    },
+                                    "required": [],
+                                },
+                            },
+                        },
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "filter_records",
+                                "description": "Suç türü veya konuma göre kayıtları filtrele ve istatistik döner.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "crime_keyword": {
+                                            "type": "string",
+                                            "description": "Suç türü anahtar kelime (örn: theft, assault, burglary)",
+                                        },
+                                        "location": {
+                                            "type": "string",
+                                            "description": "Konum adı (örn: Chicago, Austin)",
+                                        },
+                                    },
+                                    "required": [],
+                                },
+                            },
+                        },
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_sample_records",
+                                "description": "Filtrelenmiş veya tüm kayıtlardan örnek satırlar döner.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "limit": {
+                                            "type": "integer",
+                                            "description": "Kaç kayıt (varsayılan: 5)",
+                                        },
+                                        "crime_keyword": {
+                                            "type": "string",
+                                            "description": "Opsiyonel suç filtresi",
+                                        },
+                                        "location": {
+                                            "type": "string",
+                                            "description": "Opsiyonel konum filtresi",
+                                        },
+                                    },
+                                    "required": [],
+                                },
+                            },
+                        },
+                    ]
+
+                    def _t7_field_overview():
+                        return [
+                            {
+                                "alan": f["field"],
+                                "tur": f["type"],
+                                "dolu": f["non_null"],
+                                "essiz": f["unique"],
+                                "en_sik_degerler": f["top_values"][:5],
+                            }
+                            for f in field_overview
+                        ]
+
+                    def _t7_crime_dist(limit=10):
+                        _cf = _prof7["inferred"].get("crime_type")
+                        if not _cf:
+                            return {"hata": "Suç türü alanı seçili değil. Alan Eşleştirme bölümünden seçin."}
+                        _cc = Counter()
+                        for _, _, attrs in _pts7:
+                            v = attrs.get(_cf)
+                            if v is not None and str(v).strip():
+                                _cc[_safe_label(v)] += 1
+                        _tot = sum(_cc.values())
+                        return [
+                            {"suç_türü": n, "sayi": c, "yuzde": round(c / _tot * 100, 1)}
+                            for n, c in _cc.most_common(limit)
+                        ]
+
+                    def _t7_location_dist(group_by="city", limit=10):
+                        _lf = _prof7["inferred"].get(group_by)
+                        if not _lf:
+                            _alt = "district" if group_by == "city" else "city"
+                            _lf = _prof7["inferred"].get(_alt)
+                        if not _lf:
+                            return {"hata": "Konum alanı seçili değil. Alan Eşleştirme bölümünden seçin."}
+                        _lc = Counter()
+                        for _, _, attrs in _pts7:
+                            v = attrs.get(_lf)
+                            if v is not None and str(v).strip():
+                                _lc[_safe_label(v)] += 1
+                        _tot = sum(_lc.values())
+                        return [
+                            {"konum": n, "sayi": c, "yuzde": round(c / _tot * 100, 1)}
+                            for n, c in _lc.most_common(limit)
+                        ]
+
+                    def _t7_filter(crime_keyword=None, location=None):
+                        _cf = _prof7["inferred"].get("crime_type")
+                        _df = _prof7["inferred"].get("description")
+                        _cityf = _prof7["inferred"].get("city")
+                        _distf = _prof7["inferred"].get("district")
+                        _matched = []
+                        for lat, lon, attrs in _pts7:
+                            if crime_keyword:
+                                _hs = " ".join(
+                                    _normalize_text(attrs.get(f, ""))
+                                    for f in [_cf, _df]
+                                    if f
+                                )
+                                if _normalize_text(crime_keyword) not in _hs:
+                                    continue
+                            if location:
+                                _hs = " ".join(
+                                    _normalize_text(attrs.get(f, ""))
+                                    for f in [_cityf, _distf]
+                                    if f
+                                )
+                                if _normalize_text(location) not in _hs:
+                                    continue
+                            _matched.append((lat, lon, attrs))
+                        _result = {
+                            "eslesen_kayit": len(_matched),
+                            "toplam_kayit": len(_pts7),
+                            "yuzde": round(len(_matched) / len(_pts7) * 100, 1) if _pts7 else 0,
+                        }
+                        if _cf:
+                            _cc = Counter()
+                            for _, _, attrs in _matched:
+                                v = attrs.get(_cf)
+                                if v is not None and str(v).strip():
+                                    _cc[_safe_label(v)] += 1
+                            _result["suç_dagilimi"] = [
+                                {"suç_türü": n, "sayi": c}
+                                for n, c in _cc.most_common(5)
+                            ]
+                        return _result
+
+                    def _t7_samples(limit=5, crime_keyword=None, location=None):
+                        _cf = _prof7["inferred"].get("crime_type")
+                        _df = _prof7["inferred"].get("description")
+                        _cityf = _prof7["inferred"].get("city")
+                        _distf = _prof7["inferred"].get("district")
+                        _datef = _prof7["inferred"].get("date")
+                        _matched = []
+                        for _, _, attrs in _pts7:
+                            if crime_keyword:
+                                _hs = " ".join(
+                                    _normalize_text(attrs.get(f, ""))
+                                    for f in [_cf, _df]
+                                    if f
+                                )
+                                if _normalize_text(crime_keyword) not in _hs:
+                                    continue
+                            if location:
+                                _hs = " ".join(
+                                    _normalize_text(attrs.get(f, ""))
+                                    for f in [_cityf, _distf]
+                                    if f
+                                )
+                                if _normalize_text(location) not in _hs:
+                                    continue
+                            _matched.append(attrs)
+                        _preview = [_cf, _df, _cityf, _distf, _datef]
+                        _rows = []
+                        for attrs in _matched[:limit]:
+                            row = {}
+                            for f in _preview:
+                                if f:
+                                    row[f] = attrs.get(f)
+                            _rows.append(row)
+                        return {"kayit_sayisi": len(_matched), "ornekler": _rows}
+
+                    _tool_dispatch_7 = {
+                        "get_field_overview": lambda a: _t7_field_overview(),
+                        "get_crime_distribution": lambda a: _t7_crime_dist(a.get("limit", 10)),
+                        "get_location_distribution": lambda a: _t7_location_dist(
+                            a.get("group_by", "city"), a.get("limit", 10)
+                        ),
+                        "filter_records": lambda a: _t7_filter(
+                            a.get("crime_keyword"), a.get("location")
+                        ),
+                        "get_sample_records": lambda a: _t7_samples(
+                            a.get("limit", 5), a.get("crime_keyword"), a.get("location")
+                        ),
+                    }
+
+                    _schema_info_7 = {
+                        "alanlar": _prof7["inferred"],
+                        "toplam_kayit": len(_pts7),
+                        "servis": service_title,
+                        "katman": layer_name,
+                    }
+
+                    _agent_msgs_7 = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Sen bir suç haritası veri analiz ajansın. Kullanıcının sorusunu cevaplamak için "
+                                "araçları kullanarak veriyi doğrudan sorgula. Harita görselini göremezsin, "
+                                "ama araçlarla veriye tam erişimin var.\n\n"
+                                "İşte çalışma şeklin:\n"
+                                "1. Önce get_field_overview ile veri yapısını anla\n"
+                                "2. get_crime_distribution ile suç dağılımını al\n"
+                                "3. get_location_distribution ile lokasyon dağılımını al\n"
+                                "4. Gerekirse filter_records ile detaylı filtreleme yap\n"
+                                "5. get_sample_records ile örnek kayıtlar gör\n\n"
+                                "Cevabını verirken mutlaka sayı ve yüzde kullan. Veriye dayan. "
+                                "Türkçe cevap ver. Kısa ve öz ol.\n\n"
+                                "Veri seti özeti:\n"
+                                + json.dumps(_schema_info_7, ensure_ascii=False)
+                            ),
+                        },
+                        {"role": "user", "content": question},
+                    ]
+
+                    _log_7 = st.empty()
+                    _log_lines_7 = []
+                    _step_7 = 0
+                    _final_answer_7 = ""
+
+                    for _ in range(10):
+                        _payload_7 = {
+                            "model": LLM_MODEL,
+                            "messages": _agent_msgs_7,
+                            "tools": TOOLS_7,
+                            "tool_choice": "auto",
+                            "max_tokens": 2048,
+                            "temperature": 0.2,
+                        }
+                        _resp_7 = _req7.post(LLM_API_URL, json=_payload_7, timeout=120)
+                        if _resp_7.status_code != 200:
+                            _log_lines_7.append(f"API hatası: {_resp_7.status_code}")
+                            break
+
+                        _data_7 = _resp_7.json()
+                        _choice_7 = _data_7["choices"][0]
+                        _msg_7 = _choice_7["message"]
+                        _finish_7 = _choice_7.get("finish_reason", "")
+
+                        if _msg_7.get("content"):
+                            _final_answer_7 = _msg_7["content"]
+
+                        if _finish_7 == "stop" or not _msg_7.get("tool_calls"):
+                            break
+
+                        _agent_msgs_7.append(_msg_7)
+
+                        for _tc7 in _msg_7["tool_calls"]:
+                            _step_7 += 1
+                            _fn7 = _tc7["function"]["name"]
+                            _fn_args7 = json.loads(_tc7["function"]["arguments"])
+                            _log_lines_7.append(
+                                f"**Adım {_step_7}:** `{_fn7}({json.dumps(_fn_args7, ensure_ascii=False)[:120]})`"
+                            )
+
+                            if _fn7 in _tool_dispatch_7:
+                                try:
+                                    _tool_out7 = _tool_dispatch_7[_fn7](_fn_args7)
+                                    _out_str7 = json.dumps(_tool_out7, ensure_ascii=False, default=str)
+                                    _log_lines_7.append(f"  ✅ {_out_str7[:300]}")
+                                except Exception as _e7:
+                                    _out_str7 = json.dumps({"hata": str(_e7)}, ensure_ascii=False)
+                                    _log_lines_7.append(f"  ❌ {_e7}")
+                            else:
+                                _out_str7 = json.dumps({"hata": f"Bilinmeyen araç: {_fn7}"})
+
+                            _agent_msgs_7.append({
+                                "role": "tool",
+                                "tool_call_id": _tc7["id"],
+                                "content": _out_str7,
+                            })
+
+                        _log_7.markdown("\n\n".join(_log_lines_7))
+
+                    _log_7.markdown("\n\n".join(_log_lines_7))
+
+                    if _final_answer_7:
+                        st.markdown("### Cevap")
+                        st.markdown(_final_answer_7)
+                    else:
+                        _plan_fb = _plan_question(question, profile)
+                        _result_fb = _execute_question_plan(points, profile, _plan_fb)
+                        _answer_fb = _answer_question(question, profile, _plan_fb, _result_fb)
+                        st.markdown("### Cevap")
+                        st.markdown(_answer_fb)
+
+                    if show_filtered_map:
+                        _plan_map = _plan_question(question, profile)
+                        _result_map = _execute_question_plan(points, profile, _plan_map)
+                        if _result_map["matched_points"]:
+                            st.markdown("### Filtrelenmiş Harita")
+                            _mf = [
+                                profile["inferred"].get("crime_type"),
+                                profile["inferred"].get("description"),
+                                profile["inferred"].get("city"),
+                                profile["inferred"].get("district"),
+                                profile["inferred"].get("date"),
+                            ]
+                            _fmap = _build_folium_map(
+                                _result_map["matched_points"],
+                                [f for f in _mf if f],
+                            )
+                            st_folium(
+                                _fmap,
+                                height=500,
+                                use_container_width=True,
+                                returned_objects=[],
+                                key="demo7_filtered_map",
+                            )
+
+                    st.success(f"Agent tamamlandı ({_step_7} adım)")
+
+                except Exception as e:
+                    st.error(f"Hata: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
 
 # ── FOOTER ───────────────────────────────────────────────────────────
