@@ -121,10 +121,10 @@ def _query_point_features(layer_url: str, max_records: int) -> list[tuple[float,
     return points
 
 
-# LLM_API_URL = "http://192.168.1.200:8001/v1/chat/completions"
-# LLM_MODEL = "moonshotai/Kimi-K2.6"
-LLM_API_URL = "http://192.168.1.200:8000/v1/chat/completions"
-LLM_MODEL = "GLM-5.1-FP8"
+LLM_API_URL = "http://192.168.1.200:8001/v1/chat/completions"
+LLM_MODEL = "moonshotai/Kimi-K2.6"
+# LLM_API_URL = "http://192.168.1.200:8000/v1/chat/completions"
+# LLM_MODEL = "GLM-5.1-FP8"
 
 FIELD_HINTS = {
     "crime_type": [
@@ -595,11 +595,28 @@ Analysis:
 
 def _build_folium_map(points: list[tuple[float, float, dict]], title_fields: list[str] | None = None):
     import folium
-    from folium.plugins import MarkerCluster
+    from folium.plugins import MarkerCluster, Fullscreen, MeasureControl, MiniMap
 
     center_lat = sum(lat for lat, _, _ in points) / len(points)
     center_lon = sum(lon for _, lon, _ in points) / len(points)
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles="CartoDB positron")
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=11,
+        tiles="CartoDB positron",
+        zoom_snap=0.25,
+        zoom_delta=0.5,
+        max_zoom=20,
+        prefer_canvas=True,
+    )
+
+    folium.TileLayer("OpenStreetMap", name="OpenStreetMap", max_zoom=20).add_to(m)
+    folium.TileLayer("CartoDB dark_matter", name="Karanlık Tema", max_zoom=20).add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    Fullscreen(position="topright", title="Tam ekran", title_cancel="Çık").add_to(m)
+    MeasureControl(position="bottomleft", primary_length_unit="kilometers", primary_area_unit="sqmeters").add_to(m)
+    MiniMap(toggle_display=True, position="bottomright").add_to(m)
+
     cluster = MarkerCluster().add_to(m)
     for lat, lon, attrs in points:
         popup_lines = []
@@ -614,7 +631,8 @@ def _build_folium_map(points: list[tuple[float, float, dict]], title_fields: lis
             fill_color="#ea580c",
             fill_opacity=0.7,
             weight=1,
-            popup=folium.Popup("<br>".join(popup_lines), max_width=320),
+            popup=folium.Popup("<br>".join(popup_lines), max_width=400),
+            tooltip=escape(str(attrs.get(fields[0], "")))[:80] if fields else None,
         ).add_to(cluster)
     return m
 
@@ -658,6 +676,36 @@ with st.sidebar:
 
     input_path = None
 
+    _qp = st.query_params
+    if "lat" in _qp and "lon" in _qp:
+        try:
+            _qp_lat = float(_qp["lat"])
+            _qp_lon = float(_qp["lon"])
+            del _qp["lat"]
+            del _qp["lon"]
+            _qp_loc = {
+                "center": [_qp_lon, _qp_lat],
+                "bbox": [_qp_lon - 0.01, _qp_lat - 0.01, _qp_lon + 0.01, _qp_lat + 0.01],
+            }
+            st.session_state["location"] = _qp_loc
+            if "input_path" in st.session_state and os.path.exists(str(st.session_state["input_path"])):
+                input_path = st.session_state["input_path"]
+                st.success(f"📍 Tam ekrandan konum alındı: {_qp_lat:.4f}°N, {_qp_lon:.4f}°E")
+            else:
+                with st.spinner(f"Uydu görüntüsü indiriliyor ({_qp_lat:.4f}, {_qp_lon:.4f})..."):
+                    try:
+                        _qp_tile = download_location_imagery(_qp_loc)
+                        if _qp_tile:
+                            st.session_state["input_path"] = _qp_tile
+                            input_path = _qp_tile
+                            st.success(f"📍 Tam ekrandan konum alındı: {_qp_lat:.4f}°N, {_qp_lon:.4f}°E")
+                        else:
+                            st.warning("Uydu görüntüsü indirilemedi")
+                    except Exception as e:
+                        st.error(f"İndirme hatası: {e}")
+        except (ValueError, TypeError):
+            pass
+
     if loc_method == "Şehir Seç":
         city = st.selectbox("Şehir", list(LOCATIONS.keys()))
         loc_data = LOCATIONS[city]
@@ -672,7 +720,7 @@ with st.sidebar:
             popup=city,
             icon=folium.Icon(color="blue", icon="crosshairs", prefix="fa"),
         ).add_to(m)
-        st_folium(m, height=300, use_container_width=True, returned_objects=[])
+        st_folium(m, height=400, use_container_width=True, returned_objects=[])
         if st.button("Bu konumu kullan", key="use_city"):
             st.session_state["location"] = loc_data
             if "input_path" in st.session_state and os.path.exists(str(st.session_state["input_path"])):
@@ -706,7 +754,7 @@ with st.sidebar:
             popup=f"{lat:.4f}°N, {lon:.4f}°E",
             icon=folium.Icon(color="blue", icon="crosshairs", prefix="fa"),
         ).add_to(m)
-        st_folium(m, height=300, use_container_width=True, returned_objects=[])
+        st_folium(m, height=400, use_container_width=True, returned_objects=[])
         if st.button("Bu konumu kullan", key="use_coords"):
             loc_data = {
                 "center": [lon, lat],
@@ -793,6 +841,251 @@ with st.sidebar:
     if "input_path" in st.session_state and input_path is None:
         input_path = st.session_state["input_path"]
 
+    st.divider()
+    st.subheader("🗺️ Tam Ekran Harita")
+    st.caption("Ayrıntılı OpenStreetMap'te gezin, konum seçin")
+    if st.button("🖥️ Tam Ekran Haritayı Aç", key="open_fullscreen_osm", use_container_width=True):
+        import webbrowser, threading, http.server, socketserver
+
+        _st_base_url = "http://localhost:8501"
+        try:
+            from streamlit.web.server.server import Server
+            _srv = Server.get_current()
+            _st_base_url = f"http://localhost:{_srv._port}"
+        except Exception:
+            try:
+                _st_base_url = f"http://localhost:{os.environ.get('STREAMLIT_SERVER_PORT', '8501')}"
+            except Exception:
+                pass
+
+        _osm_html = """<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>OpenStreetMap — Tam Ekran</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body,#map{width:100%;height:100%;font-family:system-ui,-apple-system,sans-serif}
+#search-box{position:absolute;top:12px;left:60px;z-index:1000;width:340px;display:flex;gap:6px}
+#search-box input{flex:1;padding:10px 14px;border:none;border-radius:8px;font-size:15px;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+#search-box button{padding:10px 16px;border:none;border-radius:8px;background:#2563eb;color:#fff;font-size:14px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25);white-space:nowrap}
+#search-box button:hover{background:#1d4ed8}
+#coord-panel{position:absolute;bottom:56px;left:50%;transform:translateX(-50%);z-index:1000;background:#fff;border-radius:12px;padding:14px 22px;box-shadow:0 4px 16px rgba(0,0,0,.2);display:none;text-align:center;min-width:320px}
+#coord-panel h3{margin:0 0 6px 0;font-size:15px;color:#374151}
+#coord-panel .coords{font-size:20px;font-weight:700;color:#1d4ed8;margin:4px 0}
+#coord-panel .addr{font-size:13px;color:#6b7280;margin-bottom:10px}
+#coord-panel button{padding:8px 20px;border:none;border-radius:6px;background:#059669;color:#fff;font-size:14px;cursor:pointer;margin:2px}
+#coord-panel button:hover{background:#047857}
+#coord-panel button.copy-btn{background:#6366f1}
+#coord-panel button.copy-btn:hover{background:#4f46e5}
+.layer-btn{position:absolute;top:12px;right:12px;z-index:1000;display:flex;flex-direction:column;gap:4px}
+.layer-btn button{padding:8px 12px;border:none;border-radius:6px;background:#fff;font-size:12px;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.15)}
+.layer-btn button.active{background:#2563eb;color:#fff}
+.leaflet-control-zoom{margin-top:60px!important}
+#toast{position:absolute;top:70px;left:50%;transform:translateX(-50%);z-index:2000;background:#059669;color:#fff;padding:10px 20px;border-radius:8px;display:none;font-size:14px}
+#info-bar{position:absolute;bottom:28px;right:12px;z-index:1000;background:rgba(15,23,42,.92);color:#e2e8f0;font-size:16px;padding:20px 26px;border-radius:14px;display:flex;flex-direction:column;gap:9px;font-family:'SF Mono',SFMono-Regular,Consolas,'Liberation Mono',Menlo,monospace;backdrop-filter:blur(12px);border:1px solid rgba(99,102,241,.25);box-shadow:0 4px 24px rgba(0,0,0,.4);min-width:380px}
+#info-bar .row{display:flex;align-items:center;gap:12px}
+#info-bar .icon{width:28px;text-align:center;font-size:18px;flex-shrink:0}
+#info-bar .label{color:#818cf8;font-size:12px;text-transform:uppercase;letter-spacing:.6px;width:54px;flex-shrink:0}
+#info-bar .val{color:#f1f5f9;font-weight:600;font-size:15px;letter-spacing:.3px}
+#info-bar .divider-line{height:1px;background:rgba(99,102,241,.2);margin:2px 0}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="search-box">
+  <input id="q" placeholder="Konum ara... (ör: İstanbul, Ankara)" onkeydown="if(event.key==='Enter')doSearch()"/>
+  <button onclick="doSearch()">Ara</button>
+</div>
+<div class="layer-btn">
+  <button class="active" onclick="setLayer('osm',this)">OpenStreetMap</button>
+  <button onclick="setLayer('sat',this)">Uydu</button>
+  <button onclick="setLayer('topo',this)">Topografik</button>
+  <button onclick="setLayer('dark',this)">Karanlık</button>
+</div>
+<div id="coord-panel">
+  <h3>📍 Seçilen Konum</h3>
+  <div class="coords" id="coord-text">—</div>
+  <div class="addr" id="addr-text"></div>
+  <button class="copy-btn" onclick="copyCoords()">📋 Koordinatları Kopyala</button>
+  <button onclick="copyAndClose()">✅ Koordinatları Gir (Sidebar)</button>
+</div>
+<div id="toast">Kopyalandı!</div>
+<div id="info-bar">
+  <div class="row"><span class="icon">🎯</span><span class="label">MGRS</span><span class="val" id="mgrs-text">—</span></div>
+  <div class="divider-line"></div>
+  <div class="row"><span class="icon">🗺️</span><span class="label">UTM</span><span class="val" id="utm-text">—</span></div>
+  <div class="divider-line"></div>
+  <div class="row"><span class="icon">📏</span><span class="label">Ölçek</span><span class="val" id="scale-text">—</span></div>
+  <div class="divider-line"></div>
+  <div class="row"><span class="icon">📍</span><span class="label">İmleç</span><span class="val" id="cursor-text">—</span></div>
+</div>
+<script>
+var _BANDS='CDEFGHJKLMNPQRSTUVWX';
+var _COL_LETTERS='STUVWXYZABCDEFGHJKLMNPQRS';
+var _ROW_LETTERS_N='ABCDEFGHJKLMNPQRSTUV';
+var _ROW_LETTERS_S='FGHJKLMNPQRSTUVABCDE';
+
+function _llToUtm(lat,lon){
+  var a=6378137,f=1/298.257223563,e2=2*f-f*f,ep2=e2/(1-e2),e1=(1-Math.sqrt(1-e2))/(1+Math.sqrt(1-e2));
+  var zn=Math.floor((lon+180)/6)+1,zs=lat>=0?'N':'S';
+  var cm=(zn-1)*6-180+3;
+  var latR=lat*Math.PI/180,sn=Math.sin(latR),cs=Math.cos(latR),tn=Math.tan(latR);
+  var nu=a/Math.sqrt(1-e2*sn*sn),N=a/Math.sqrt(1-e2*sn*sn);
+  var T=tn*tn,C=ep2*cs*cs,A=(lon-cm)*Math.PI/180;
+  var M=a*((1-e2/4-3*e2*e2/64-5*e2*e2*e2/256)*latR-(3*e2/8+3*e2*e2/32+45*e2*e2*e2/1024)*Math.sin(2*latR)+(15*e2*e2/256+45*e2*e2*e2/1024)*Math.sin(4*latR)-(35*e2*e2*e2/3072)*Math.sin(6*latR));
+  var k0=0.9996,E=k0*N*(A+(1-T+C)*A*A*A/6+(5-18*T+T*T+72*C-58*ep2)*A*A*A*A*A/120)+500000;
+  var nn=k0*(M+N*Math.tan(latR)*(A*A/2+(5-T+9*C+4*C*C-19*ep2)*A*A*A*A/24+(61-58*T+T*T+600*C-220*ep2)*A*A*A*A*A*A/720));
+  if(lat<0)nn+=10000000;
+  return{zone:zn,letter:zs,easting:E,northing:nn}
+}
+
+function _utmToMgrs(zn,zs,E,N){
+  var bi=Math.round((E-1)/100000)-1,cL=_COL_LETTERS[(zn-1)%3*8+bi];
+  var bset=zn%2===0?1:0;
+  var rI=Math.floor(N%2000000/100000);
+  var rL=(zs==='N'?_ROW_LETTERS_N:_ROW_LETTERS_S)[(bset*5+rI)%20];
+  var e1k=Math.floor(E%100000),n1k=Math.floor(N%100000);
+  return String(zn)+zs+' '+cL+rL+' '+('00000'+e1k).slice(-5)+' '+('00000'+n1k).slice(-5);
+}
+
+function _getScale(zoom,lat){
+  var c=2*Math.PI*6378137;
+  var ms=c*Math.cos(lat*Math.PI/180)/Math.pow(2,zoom+8);
+  var nice=[100,200,500,1000,2000,5000,10000,20000,50000,100000,200000,500000,1000000,5000000,10000000];
+  var best=nice[0];for(var i=0;i<nice.length;i++){if(nice[i]<ms*150)best=nice[i]}
+  return '1:'+best.toLocaleString();
+}
+
+var map=L.map('map',{zoomControl:true,attributionControl:true}).setView([41.05,29.0],6);
+var layers={
+  osm:L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'}),
+  sat:L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'© Esri'}),
+  topo:L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',{maxZoom:17,attribution:'© OpenTopoMap'}),
+  dark:L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19,attribution:'© CartoDB'})
+};
+var currentLayer=layers.osm.addTo(map);
+var marker=null;
+var selectedLat=null,selectedLon=null;
+
+function _updateInfoBar(lat,lon){
+  try{
+    var u=_llToUtm(lat,lon);
+    document.getElementById('mgrs-text').textContent=_utmToMgrs(u.zone,u.letter,u.easting,u.northing);
+    document.getElementById('utm-text').textContent=u.zone+u.letter+' '+Math.round(u.easting)+'E '+Math.round(u.northing)+'N';
+    document.getElementById('scale-text').textContent=_getScale(map.getZoom(),lat);
+    document.getElementById('cursor-text').textContent=lat.toFixed(6)+'°N, '+lon.toFixed(6)+'°E';
+  }catch(e){}
+}
+
+map.on('mousemove',function(e){_updateInfoBar(e.latlng.lat,e.latlng.lng)});
+map.on('zoomend moveend',function(){
+  var c=map.getCenter();_updateInfoBar(c.lat,c.lng);
+});
+
+L.control.scale({metric:true,imperial:false,position:'bottomleft'}).addTo(map);
+
+function setLayer(name,btn){
+  map.removeLayer(currentLayer);
+  currentLayer=layers[name].addTo(map);
+  document.querySelectorAll('.layer-btn button').forEach(function(b){b.classList.remove('active')});
+  btn.classList.add('active');
+}
+
+map.on('click',function(e){
+  selectedLat=e.latlng.lat;
+  selectedLon=e.latlng.lng;
+  if(marker)map.removeLayer(marker);
+  marker=L.marker(e.latlng,{draggable:true}).addTo(map);
+  marker.on('dragend',function(ev){
+    selectedLat=ev.target.getLatLng().lat;
+    selectedLon=ev.target.getLatLng().lng;
+    updatePanel();
+  });
+  updatePanel();
+  reverseGeocode(selectedLat,selectedLon);
+});
+
+function updatePanel(){
+  var p=document.getElementById('coord-panel');
+  p.style.display='block';
+  document.getElementById('coord-text').textContent=selectedLat.toFixed(6)+'°N, '+selectedLon.toFixed(6)+'°E';
+}
+
+function reverseGeocode(lat,lon){
+  fetch('https://nominatim.openstreetmap.org/reverse?format=json&lat='+lat+'&lon='+lon+'&accept-language=tr')
+    .then(function(r){return r.json()})
+    .then(function(d){
+      var addr=d.display_name||'';
+      document.getElementById('addr-text').textContent=addr;
+    })
+    .catch(function(){document.getElementById('addr-text').textContent='';});
+}
+
+function doSearch(){
+  var q=document.getElementById('q').value.trim();
+  if(!q)return;
+  fetch('https://nominatim.openstreetmap.org/search?format=json&q='+encodeURIComponent(q)+'&limit=1&accept-language=tr')
+    .then(function(r){return r.json()})
+    .then(function(d){
+      if(d.length>0){
+        var r=d[0];
+        var lat=parseFloat(r.lat),lon=parseFloat(r.lon);
+        map.setView([lat,lon],14);
+        if(marker)map.removeLayer(marker);
+        selectedLat=lat;selectedLon=lon;
+        marker=L.marker([lat,lon],{draggable:true}).addTo(map);
+        marker.on('dragend',function(ev){
+          selectedLat=ev.target.getLatLng().lat;
+          selectedLon=ev.target.getLatLng().lng;
+          updatePanel();reverseGeocode(selectedLat,selectedLon);
+        });
+        updatePanel();
+        document.getElementById('addr-text').textContent=r.display_name||'';
+      }else{alert('Sonuç bulunamadı');}
+    });
+}
+
+function copyCoords(){
+  var t=selectedLat.toFixed(6)+', '+selectedLon.toFixed(6);
+  navigator.clipboard.writeText(t);
+  var toast=document.getElementById('toast');toast.style.display='block';
+  setTimeout(function(){toast.style.display='none'},1500);
+}
+
+function copyAndClose(){
+  window.location.href='__ST_BASE_URL__/?lat='+selectedLat.toFixed(6)+'&lon='+selectedLon.toFixed(6);
+}
+</script>
+</body>
+</html>"""
+
+        _osm_html = _osm_html.replace("__ST_BASE_URL__", _st_base_url)
+        _osm_dir = Path(st.session_state.get("out_dir", tempfile.mkdtemp()))
+        _osm_path = str(_osm_dir / "fullscreen_osm.html")
+        with open(_osm_path, "w", encoding="utf-8") as _f:
+            _f.write(_osm_html)
+
+        class _OSMHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=str(_osm_dir), **kw)
+            def log_message(self, *a):
+                pass
+
+        if "osm_http_port" not in st.session_state:
+            _httpd = socketserver.TCPServer(("", 0), _OSMHandler)
+            _port = _httpd.server_address[1]
+            st.session_state["osm_http_port"] = _port
+            threading.Thread(target=_httpd.serve_forever, daemon=True).start()
+        else:
+            _port = st.session_state["osm_http_port"]
+
+        webbrowser.open(f"http://localhost:{_port}/fullscreen_osm.html")
+        st.success(f"Harita açıldı: http://localhost:{_port}/fullscreen_osm.html")
+
     # Dosya bilgisi
     if input_path and os.path.exists(str(input_path)):
         with st.expander("📊 Veri Bilgisi"):
@@ -860,7 +1153,7 @@ if demo_choice.startswith("01"):
                     model = GroundedSAM(
                         detector_id="IDEA-Research/grounding-dino-tiny",
                         segmenter_id="facebook/sam-vit-base",
-                        threshold=threshold,
+                        threshold=0.35,
                     )
 
                     _orig_gsam_detect = model._detect
@@ -1000,15 +1293,43 @@ if demo_choice.startswith("01"):
 
 # ── DEMO 02: Fotoğrafa Sor ───────────────────────────────────────────
 elif demo_choice.startswith("02"):
+    if input_path and os.path.exists(str(input_path)):
+        try:
+            import rasterio
+            with rasterio.open(str(input_path)) as src:
+                if src.count >= 3:
+                    _preview = _norm_rgb(np.transpose(src.read([1, 2, 3]), (1, 2, 0)))
+                    _c1, _c2 = st.columns([1, 2])
+                    with _c1:
+                        st.image(_preview, caption="Seçilen Uydu Görüntüsü", use_container_width=True)
+                else:
+                    _band = src.read(1).astype(np.float32)
+                    _valid = _band[_band > 0]
+                    if len(_valid) > 0:
+                        _p2, _p98 = np.nanpercentile(_valid, [2, 98])
+                        _band = np.clip((_band - _p2) / (_p98 - _p2 + 1e-10) * 255, 0, 255)
+                    _c1, _c2 = st.columns([1, 2])
+                    with _c1:
+                        st.image(_band.astype(np.uint8), caption="Seçilen Uydu Görüntüsü (tek bant)", use_container_width=True)
+        except Exception:
+            try:
+                from PIL import Image as PILImage
+                st.image(PILImage.open(str(input_path)), caption="Seçilen Uydu Görüntüsü", use_container_width=True)
+            except Exception:
+                st.warning("Görüntü önizlenemiyor")
+    else:
+        st.info("Önce sidebar'dan bir konum seçin.")
+
     default_qs = [
-        "Describe this satellite image in detail.",
-        "How many buildings can you see?",
-        "Is there any water body?",
-        "What type of vegetation is present?",
-        "What is the main land use?",
+        "Bu uydu görüntüsünü detaylı şekilde tarif et. Yerleşim yerleri, yollar, su kaynakları ve yeşil alanlar dahil tüm önemli unsurları belirt.",
+        "Görüntüde kaç bina tahmin ediyorsun? Yoğunluk olarak nasıl dağılmışlar? Kırsal mı kentsel mi bir alan?",
+        "Görüntüde herhangi bir su kütlesi (göl, nehir, deniz, baraj) var mı? Varsa konumunu ve büyüklüğünü tahmin et.",
+        "Bitki örtüsü hakkında ne söyleyebilirsin? Tarım alanı mı, doğal orman mı, yoksa park alanı mı? Yoğunluk seviyesi nedir?",
+        "Arazi kullanımını sınıflandır: tarım, konut, sanayi, ulaşım, boş arazi. Her birin tahmini oranını ver.",
+        "Bu bölgede olası afet riskleri nelerdir? Sel, heyelan, deprem açısından değerlendir.",
     ]
     questions_text = st.text_area(
-        "Sorular (her satıra bir tane)", value="\n".join(default_qs), height=150
+        "Sorular (her satıra bir tane)", value="\n".join(default_qs), height=200
     )
     questions = [q.strip() for q in questions_text.split("\n") if q.strip()]
 
@@ -1039,6 +1360,17 @@ elif demo_choice.startswith("02"):
                         "model": LLM_MODEL,
                         "messages": [
                             {
+                                "role": "system",
+                                "content": (
+                                    "Sen uzman bir uydu görüntüsü analistisin. Verilen uydu görüntüsünü "
+                                    "en ince ayrıntısına kadar analiz et. Cevapların her zaman uzun, "
+                                    "detaylı ve yapılandırılmış olsun. Kısa veya eksik cevap verme. "
+                                    "Gördüğün her unsuru say, konumlarını belirt, büyüklüklerini tahmin et. "
+                                    "Emin olmadığın konularda 'tahminen' veya 'muhtemelen' ifadelerini kullan ama "
+                                    "asla 'None' veya boş cevap verme. En az 3-4 cümle yaz."
+                                ),
+                            },
+                            {
                                 "role": "user",
                                 "content": [
                                     {
@@ -1049,10 +1381,10 @@ elif demo_choice.startswith("02"):
                                     },
                                     {"type": "text", "text": q},
                                 ],
-                            }
+                            },
                         ],
-                        "max_tokens": 1024,
-                        "temperature": 0.3,
+                        "max_tokens": 2048,
+                        "temperature": 0.4,
                     }
                     resp = req.post(
                         LLM_API_URL,
@@ -1060,7 +1392,24 @@ elif demo_choice.startswith("02"):
                         timeout=120,
                     )
                     if resp.status_code == 200:
-                        answer = resp.json()["choices"][0]["message"]["content"]
+                        _rj = resp.json()
+                        answer = _rj["choices"][0]["message"]["content"]
+                        _finish = _rj["choices"][0].get("finish_reason", "")
+                        if answer is None and _finish == "length":
+                            retry_payload = dict(payload)
+                            retry_payload["max_tokens"] = 4096
+                            retry_resp = req.post(LLM_API_URL, json=retry_payload, timeout=120)
+                            if retry_resp.status_code == 200:
+                                answer = retry_resp.json()["choices"][0]["message"]["content"]
+                        if answer is None:
+                            for _attempt in range(2):
+                                retry_resp = req.post(LLM_API_URL, json=payload, timeout=120)
+                                if retry_resp.status_code == 200:
+                                    answer = retry_resp.json()["choices"][0]["message"]["content"]
+                                    if answer is not None:
+                                        break
+                        if not answer:
+                            answer = "Model bu soruya cevap üretemedi. Lütfen farklı bir şekilde sorun."
                         st.markdown(f"**Q:** {q}")
                         st.markdown(f"**A:** {answer}")
                     else:
@@ -1542,8 +1891,10 @@ elif demo_choice.startswith("03"):
 # ── DEMO 04: xView2 Hasar Tespiti ─────────────────────────────────────────
 elif demo_choice.startswith("04"):
     XVIEW2_DIR = Path("/home/openzeka/Desktop/mekansal-veri/xView2-deploy")
-    TEST_PRE = XVIEW2_DIR / "tests" / "data" / "input" / "pre"
-    TEST_POST = XVIEW2_DIR / "tests" / "data" / "input" / "post"
+    CHIPS_PRE = XVIEW2_DIR / "tests" / "data" / "output" / "chips" / "pre"
+    CHIPS_POST = XVIEW2_DIR / "tests" / "data" / "output" / "chips" / "post"
+    TILE_PRE = XVIEW2_DIR / "tests" / "data" / "input" / "pre"
+    TILE_POST = XVIEW2_DIR / "tests" / "data" / "input" / "post"
 
     st.markdown("""
     **Bina Hasar Tespiti** — Afet sonrası uydu görüntülerinden bina hasarını sınıflandırır.
@@ -1557,18 +1908,45 @@ elif demo_choice.startswith("04"):
     post_path = None
 
     if use_test_data:
-        pre_files = sorted(TEST_PRE.glob("*.tif")) if TEST_PRE.exists() else []
-        post_files = sorted(TEST_POST.glob("*.tif")) if TEST_POST.exists() else []
-        if pre_files and post_files:
-            pre_path = str(pre_files[0])
-            post_path = str(post_files[0])
-            st.info(f"Pre: `{Path(pre_path).name}` | Post: `{Path(post_path).name}`")
-            if len(pre_files) > 1:
-                sel = st.selectbox("Pre görüntü seç", range(len(pre_files)), format_func=lambda i: pre_files[i].name)
-                pre_path = str(pre_files[sel])
-            if len(post_files) > 1:
-                sel = st.selectbox("Post görüntü seç", range(len(post_files)), format_func=lambda i: post_files[i].name)
-                post_path = str(post_files[sel])
+        if CHIPS_PRE.exists() and CHIPS_POST.exists():
+            chip_pre_files = sorted(CHIPS_PRE.glob("*.tif"))
+            chip_post_files = sorted(CHIPS_POST.glob("*.tif"))
+            if chip_pre_files and chip_post_files:
+                chip_pairs = []
+                for pf in chip_pre_files:
+                    idx = pf.name.split("_")[0]
+                    corresponding = CHIPS_POST / f"{idx}_post.tif"
+                    if corresponding.exists():
+                        chip_pairs.append((pf.name, corresponding.name, idx))
+                if chip_pairs:
+                    sel_idx = st.selectbox(
+                        "Chip çifti seç",
+                        range(len(chip_pairs)),
+                        format_func=lambda i: f"Chip {chip_pairs[i][2]} (pre/post eşleşmeli)",
+                    )
+                    pre_name, post_name, _ = chip_pairs[sel_idx]
+                    pre_path = str(CHIPS_PRE / pre_name)
+                    post_path = str(CHIPS_POST / post_name)
+                    st.info(f"Pre: `{pre_name}` | Post: `{post_name}`")
+                else:
+                    st.warning("Eşleşmiş chip çifti bulunamadı.")
+                    use_test_data = False
+            else:
+                st.warning("Chip dosyaları bulunamadı.")
+                use_test_data = False
+        elif TILE_PRE.exists() and TILE_POST.exists():
+            pre_files = sorted(TILE_PRE.glob("*.tif"))
+            post_files = sorted(TILE_POST.glob("*.tif"))
+            if pre_files and post_files:
+                sel_pre = st.selectbox("Pre görüntü seç", range(len(pre_files)), format_func=lambda i: pre_files[i].name)
+                sel_post = st.selectbox("Post görüntü seç", range(len(post_files)), format_func=lambda i: post_files[i].name)
+                pre_path = str(pre_files[sel_pre])
+                post_path = str(post_files[sel_post])
+                st.info(f"Pre: `{pre_files[sel_pre].name}` | Post: `{post_files[sel_post].name}`")
+                st.warning("Bu görüntüler farklı konumları kapsıyor olabilir — chip çiftleri tercih edilir.")
+            else:
+                st.warning("Test verisi bulunamadı.")
+                use_test_data = False
         else:
             st.warning("Test verisi bulunamadı. Lütfen manuel olarak yükleyin.")
             use_test_data = False
@@ -2181,13 +2559,56 @@ elif demo_choice.startswith("07"):
             profile["inferred"].get("date"),
         ]
         current_map = _build_folium_map(points, [field for field in current_map_fields if field])
-        st_folium(
-            current_map,
-            height=520,
-            use_container_width=True,
-            returned_objects=[],
-            key="demo7_current_map",
-        )
+
+        _map_html_path = str(Path(st.session_state["out_dir"]) / "fullscreen_map.html")
+        with open(_map_html_path, "w", encoding="utf-8") as f:
+            f.write(current_map.get_root().render())
+
+        _col_preview, _col_btn = st.columns([4, 1])
+        with _col_preview:
+            st_folium(
+                current_map,
+                height=800,
+                use_container_width=True,
+                returned_objects=[],
+                key="demo7_current_map",
+            )
+        with _col_btn:
+            st.markdown("### ")
+            st.markdown("### ")
+            with open(_map_html_path, "r", encoding="utf-8") as f:
+                _map_html_content = f.read()
+            st.download_button(
+                "🖥️ Haritayı HTML\nolarak indir",
+                data=_map_html_content,
+                file_name="harita_tam_ekran.html",
+                mime="text/html",
+                key="demo7_download_map",
+                help="İndirilen HTML dosyasını tarayıcıda açın — tam ekran, sınırsız zoom, kaydırma",
+            )
+            if st.button("🖥️ Yeni Sekmede Aç", key="demo7_open_fullscreen", help="Haritayı tam ekran yeni sekmede açar"):
+                _port = st.secrets.get("server_port", 8501) if hasattr(st, "secrets") else 8501
+                import webbrowser
+                import threading
+                import http.server
+                import socketserver
+
+                class _MapHandler(socketserver.SimpleHTTPRequestHandler):
+                    def __init__(self, *a, **kw):
+                        super().__init__(*a, directory=str(Path(st.session_state["out_dir"])), **kw)
+                    def log_message(self, *a):
+                        pass
+
+                if "demo7_http_port" not in st.session_state:
+                    _httpd = socketserver.TCPServer(("", 0), _MapHandler)
+                    _port = _httpd.server_address[1]
+                    st.session_state["demo7_http_port"] = _port
+                    threading.Thread(target=_httpd.serve_forever, daemon=True).start()
+                else:
+                    _port = st.session_state["demo7_http_port"]
+
+                webbrowser.open(f"http://localhost:{_port}/fullscreen_map.html")
+                st.success(f"Harita açıldı: http://localhost:{_port}/fullscreen_map.html")
 
         st.subheader("Harita Agent")
         st.caption("Agent, veri setini doğrudan sorgulamak için araçları kullanır. Harita görselini okumak yerine alttaki veriyi analiz eder.")
@@ -2554,13 +2975,31 @@ elif demo_choice.startswith("07"):
                                 _result_map["matched_points"],
                                 [f for f in _mf if f],
                             )
-                            st_folium(
-                                _fmap,
-                                height=500,
-                                use_container_width=True,
-                                returned_objects=[],
-                                key="demo7_filtered_map",
-                            )
+                            _fmap_html_path = str(Path(st.session_state["out_dir"]) / "filtered_map.html")
+                            with open(_fmap_html_path, "w", encoding="utf-8") as f:
+                                f.write(_fmap.get_root().render())
+                            _fc1, _fc2 = st.columns([4, 1])
+                            with _fc1:
+                                st_folium(
+                                    _fmap,
+                                    height=800,
+                                    use_container_width=True,
+                                    returned_objects=[],
+                                    key="demo7_filtered_map",
+                                )
+                            with _fc2:
+                                st.markdown("### ")
+                                st.markdown("### ")
+                                with open(_fmap_html_path, "r", encoding="utf-8") as f:
+                                    _fmap_html_content = f.read()
+                                st.download_button(
+                                    "🖥️ Filtrelenmiş\nHaritayı İndir",
+                                    data=_fmap_html_content,
+                                    file_name="filtrelenmis_harita.html",
+                                    mime="text/html",
+                                    key="demo7_download_filtered_map",
+                                    help="İndirilen HTML dosyasını tarayıcıda açın",
+                                )
 
                     st.success(f"Agent tamamlandı ({_step_7} adım)")
 
