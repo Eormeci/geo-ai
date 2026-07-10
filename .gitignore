@@ -2,6 +2,8 @@
 !.gitignore
 !*.ipynb
 !*/
+!README.md
+!app.py
 xView2-segmentation/
 xView2-deploy/
 pytorch-change-models/
