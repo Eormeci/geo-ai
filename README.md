@@ -1,21 +1,8 @@
 # GeoAI
 
-A geospatial AI platform with a Streamlit-based interactive web app and 90+ Jupyter notebooks covering remote sensing, computer vision, and geospatial machine learning workflows.
+A collection of 90+ Jupyter notebooks for geospatial AI — covering remote sensing, computer vision, and geospatial machine learning workflows.
 
-## Features
-
-### Streamlit Web App (`app.py`)
-
-An all-in-one geospatial demo interface with:
-
-- **Multi-format support** — GeoTIFF, COG, Shapefile, GeoJSON, GeoPackage, KML/KMZ, GPX, Sentinel-2, Landsat, NAIP, Planet (via STAC)
-- **Location-based imagery** — Search any location and download satellite imagery
-- **Interactive maps** — Folium-based with fullscreen mode, HTML export, and download
-- **ArcGIS integration** — Search public feature services, auto-detect point layers, query features
-- **LLM-powered map agent** — Ask questions about mapped data in natural language; the agent uses function-calling tools to query, filter, and analyze the dataset
-- **Automated field inference** — Auto-detects crime type, description, city, district, and date fields from arbitrary ArcGIS schemas
-
-### Notebooks (90+)
+## Notebooks (90+)
 
 Organized by topic:
 
@@ -36,27 +23,10 @@ Organized by topic:
 
 ## Tech Stack
 
-- **Web App**: Streamlit, Folium, ArcGIS REST API
-- **LLM Agent**: OpenAI-compatible API with function calling
 - **Geospatial**: Rasterio, GeoPandas, Shapely, STAC
 - **ML**: TensorFlow, PyTorch, KerasNLP, timm, DINOv3, SAM, Grounded SAM
 - **Satellite Data**: Microsoft Planetary Computer, Sentinel-2, Landsat, NAIP
 
-## Getting Started
-
-```bash
-pip install streamlit folium rasterio geopandas requests numpy
-
-streamlit run app.py
-```
-
-For LLM agent features, configure the API endpoint in `app.py`:
-
-```python
-LLM_API_URL = "http://your-llm-endpoint/v1/chat/completions"
-LLM_MODEL = "your-model-name"
-```
-
 ## Notebooks
 
-All notebooks are in `notebooks/geoai_notebooks/`. Browse by number — each is self-contained with inline explanations.
+All notebooks are in `notebooks/geoai_notebooks/`. Each is self-contained with inline explanations.
